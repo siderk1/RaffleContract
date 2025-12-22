@@ -29,7 +29,8 @@ contract Raffle is
     enum GameState {
         Open,
         RandomRequested,
-        Finished
+        WinnerSelected,
+        Settled
     }
 
     struct UserWinningRange {
@@ -39,11 +40,10 @@ contract Raffle is
     }
 
     uint256 public constant MAX_PARTICIPANTS = 50;
-    uint256 public constant MIN_DEPOSIT_USD = 10 * 1e18;
+    uint256 public constant MIN_DEPOSIT_USD = 10e18;
 
     uint256 public gameId;
     GameState public gameState;
-
     uint256 public gameStart;
     uint256 public gameDuration;
 
@@ -60,9 +60,9 @@ contract Raffle is
     mapping(uint256 => address[]) public gameTokens;
     mapping(uint256 => mapping(address => uint256)) public gameTokenAmounts;
 
-    // fees
-    uint256 public platformFee; // bps
-    uint256 public founderFee; // bps
+    // fees (bps)
+    uint256 public platformFee;
+    uint256 public founderFee;
     address public platform;
     address public founder;
 
@@ -79,9 +79,14 @@ contract Raffle is
     mapping(uint256 => uint256) public requestIdToGameId;
     mapping(uint256 => uint256) public randomResult;
 
+    // pull balances
+    mapping(uint256 => mapping(address => uint256)) public claimable;
+    mapping(uint256 => bool) public settled;
+
     event Deposit(address indexed user, address token, uint256 usdValue);
     event WinnerSelected(uint256 indexed gameId, address winner);
-    event Settlement(uint256 indexed gameId, uint256 payout);
+    event Settled(uint256 indexed gameId, uint256 totalOut);
+    event Claimed(uint256 indexed gameId, address indexed user, uint256 amount);
 
     constructor() {
         _disableInitializers();
@@ -125,7 +130,7 @@ contract Raffle is
         address _platform,
         address _founder
     ) external onlyOwner {
-        require(_platformFee + _founderFee <= 10_000, "Bad fees");
+        require(_platformFee + _founderFee <= 2_000, "Fee cap exceeded");
         platformFee = _platformFee;
         founderFee = _founderFee;
         platform = _platform;
@@ -133,7 +138,7 @@ contract Raffle is
     }
 
     function startNewGame() external onlyOwner {
-        require(gameState == GameState.Finished, "Game active");
+        require(gameState == GameState.Settled, "Game not settled");
         gameId++;
         gameState = GameState.Open;
         gameStart = block.timestamp;
@@ -149,10 +154,7 @@ contract Raffle is
     ) external nonReentrant {
         require(gameState == GameState.Open, "Game closed");
         require(tokenToPriceFeed[token] != address(0), "Token not allowed");
-        require(
-            participants[gameId].length < MAX_PARTICIPANTS,
-            "Max participants reached"
-        );
+        require(participants[gameId].length < MAX_PARTICIPANTS, "Max reached");
 
         try
             IERC20Permit(token).permit(
@@ -218,15 +220,16 @@ contract Raffle is
         uint256 requestId,
         uint256[] calldata words
     ) internal override {
-        uint256 gid = requestIdToGameId[requestId];
-        randomResult[gid] = words[0];
+        require(gameState == GameState.RandomRequested, "Bad state");
+        randomResult[requestIdToGameId[requestId]] = words[0];
     }
 
     function finalizeWinner() external onlyOwner {
-        require(gameState == GameState.RandomRequested, "Random not requested");
+        require(gameState == GameState.RandomRequested, "Wrong state");
+
         uint256 gid = gameId;
         uint256 rnd = randomResult[gid];
-        require(rnd > 0, "Random not ready");
+        require(rnd != 0, "Random not ready");
 
         uint256 point = rnd % poolUSD[gid];
         UserWinningRange[] memory ranges = winningRanges[gid];
@@ -234,14 +237,18 @@ contract Raffle is
         for (uint256 i; i < ranges.length; i++) {
             if (point >= ranges[i].min && point < ranges[i].max) {
                 winner[gid] = ranges[i].user;
-                _settle(gid);
+                gameState = GameState.WinnerSelected;
+                emit WinnerSelected(gid, winner[gid]);
                 return;
             }
         }
         revert("No winner");
     }
 
-    function _settle(uint256 gid) internal nonReentrant {
+    function settle(uint256 gid) external nonReentrant {
+        require(gameState == GameState.WinnerSelected, "Not ready");
+        require(!settled[gid], "Already settled");
+
         uint256 totalOut;
 
         for (uint256 i; i < gameTokens[gid].length; i++) {
@@ -269,17 +276,22 @@ contract Raffle is
         uint256 founderAmt = (totalOut * founderFee) / 10_000;
         uint256 winnerAmt = totalOut - platformAmt - founderAmt;
 
-        if (platformAmt > 0)
-            IERC20(payoutToken).safeTransfer(platform, platformAmt);
-        if (founderAmt > 0)
-            IERC20(payoutToken).safeTransfer(founder, founderAmt);
+        if (platformAmt > 0) claimable[gid][platform] += platformAmt;
+        if (founderAmt > 0) claimable[gid][founder] += founderAmt;
+        claimable[gid][winner[gid]] += winnerAmt;
 
-        IERC20(payoutToken).safeTransfer(winner[gid], winnerAmt);
+        settled[gid] = true;
+        gameState = GameState.Settled;
 
-        gameState = GameState.Finished;
+        emit Settled(gid, totalOut);
+    }
 
-        emit WinnerSelected(gid, winner[gid]);
-        emit Settlement(gid, totalOut);
+    function claim(uint256 gid) external nonReentrant {
+        uint256 amount = claimable[gid][msg.sender];
+        require(amount > 0, "Nothing to claim");
+        claimable[gid][msg.sender] = 0;
+        IERC20(payoutToken).safeTransfer(msg.sender, amount);
+        emit Claimed(gid, msg.sender, amount);
     }
 
     function checkUpkeep(
@@ -287,9 +299,8 @@ contract Raffle is
     ) external view override returns (bool, bytes memory) {
         bool canTrigger = gameState == GameState.Open &&
             block.timestamp >= gameStart + gameDuration &&
-            poolUSD[gameId] > 0 &&
-            participants[gameId].length >= 1;
-        return (canTrigger, bytes(""));
+            poolUSD[gameId] > 0;
+        return (canTrigger, "");
     }
 
     function performUpkeep(bytes calldata) external override {
@@ -304,10 +315,7 @@ contract Raffle is
             tokenToPriceFeed[token]
         );
         (, int256 price, , uint256 updatedAt, ) = feed.latestRoundData();
-        require(
-            price > 0 && block.timestamp - updatedAt < 1 hours,
-            "Price stale"
-        );
+        require(price > 0 && block.timestamp - updatedAt < 1 hours, "Stale");
 
         uint256 norm = uint256(price) * (10 ** (18 - feed.decimals()));
         return (amount * norm) / 1e18;
