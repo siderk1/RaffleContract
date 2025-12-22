@@ -265,7 +265,7 @@ contract Raffle is
                     recipient: address(this),
                     deadline: block.timestamp,
                     amountIn: amount,
-                    amountOutMinimum: (amount * 95) / 100,
+                    amountOutMinimum: 0,
                     sqrtPriceLimitX96: 0
                 });
 
