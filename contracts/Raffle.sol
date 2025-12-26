@@ -137,7 +137,7 @@ contract Raffle is
         founder = _founder;
     }
 
-    function startNewGame() external onlyOwner {
+    function startNewGame() external {
         require(gameState == GameState.Settled, "Game not settled");
         gameId++;
         gameState = GameState.Open;
@@ -224,7 +224,7 @@ contract Raffle is
         randomResult[requestIdToGameId[requestId]] = words[0];
     }
 
-    function finalizeWinner() external onlyOwner {
+    function finalizeWinner() external {
         require(gameState == GameState.RandomRequested, "Wrong state");
 
         uint256 gid = gameId;
